@@ -28,6 +28,7 @@ let stockActual = 'olavarria';
 
 // -------------------- Utilidades --------------------
 
+// Normaliza texto para búsquedas por rubro/descripción
 function normalizar(str) {
   return (str || '')
     .toLowerCase()
@@ -36,39 +37,90 @@ function normalizar(str) {
     .replace(/\s+/g, '');
 }
 
-// Normalización básica para códigos (en mayúsculas, sin espacios extremos)
+// Limpia código (espacios y mayúsculas)
 function clean(str) {
   return String(str || '').trim().toUpperCase();
 }
 
+// Divide un campo de código tipo "A/B/C" en candidatos ["A","B","C"]
+// Soporta separadores "/" y " / " (y múltiples espacios).
+function splitCandidates(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split('/')        // separar por slash
+    .map(s => clean(s))
+    .filter(Boolean);  // quitar vacíos
+}
+
+// Toma el primer código si viene "X/Y/Z"
+function primaryCode(raw) {
+  const parts = splitCandidates(raw);
+  return parts[0] || '';
+}
+
 /**
- * Genera un conjunto de claves equivalentes para matchear códigos:
- * - T#####  <-> ##### (sin la T)
- * - ceros a la izquierda removidos en la versión numérica
- * - variantes sin separadores (- _ . espacios)
+ * Genera claves equivalentes para matchear un único código:
+ * - Letra + dígitos (p.ej. X1100050, F42) -> agregar variante solo-dígitos (1100050 / 42).
+ * - Caso especial T + dígitos (T1100000) -> agregar sin T (1100000) y viceversa.
+ * - Solo dígitos -> agregar T + dígitos también (para cubrir T####).
+ * - Quita separadores ( - _ . espacios ) como variante adicional.
+ * - Remueve ceros a la izquierda en la variante numérica.
  */
-function codeKeys(raw) {
+function codeKeysOne(raw) {
   const c = clean(raw);
   const keys = new Set([c]);
 
-  const mTNum = /^T(\d+)$/.exec(c);
-  if (mTNum) {
-    const num = (mTNum[1] || '').replace(/^0+/, '') || '0';
-    keys.add(num);           // 1100000
-    keys.add('T' + num);     // T1100000
-  } else {
-    const mNum = /^(\d+)$/.exec(c);
-    if (mNum) {
-      const num = (mNum[1] || '').replace(/^0+/, '') || '0';
-      keys.add(num);         // 1100000 normalizado
-      keys.add('T' + num);   // T1100000
-    }
-  }
-
+  // Variante sin separadores internos
   const noSep = c.replace(/[\s\-_.]/g, '');
   if (noSep !== c) keys.add(noSep);
 
+  // T + dígitos
+  let m = /^T(\d+)$/.exec(c);
+  if (m) {
+    const num = (m[1] || '').replace(/^0+/, '') || '0';
+    keys.add(num);
+    keys.add('T' + num);
+    return Array.from(keys);
+  }
+
+  // Cualquier letra + dígitos (X123, F48, etc.)
+  m = /^([A-Z])(\d+)$/.exec(c);
+  if (m) {
+    const num = (m[2] || '').replace(/^0+/, '') || '0';
+    keys.add(num);  // 123 / 48
+  } else {
+    // Solo dígitos
+    m = /^(\d+)$/.exec(c);
+    if (m) {
+      const num = (m[1] || '').replace(/^0+/, '') || '0';
+      keys.add(num);        // normalizado
+      keys.add('T' + num);  // T#### para cubrir variantes T
+    }
+  }
+
   return Array.from(keys);
+}
+
+/**
+ * Para un campo de stock que puede venir "F42 / F68", genera
+ * una lista de claves en ORDEN DE PRIORIDAD:
+ * - Primero las variantes de F42
+ * - Si no hay match, probar variantes de F68
+ * - etc.
+ */
+function codeKeys(raw) {
+  const parts = splitCandidates(raw); // ["F42","F68"]
+  const out = [];
+  const seen = new Set();
+  for (const p of parts) {
+    for (const k of codeKeysOne(p)) {
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(k);
+      }
+    }
+  }
+  return out;
 }
 
 function esCamionImportado(rubro) {
@@ -78,14 +130,8 @@ function esCamionImportado(rubro) {
 
 function esAutoImportado(rubro) {
   const normal = normalizar(rubro);
-  const rubrosExactos = [
-    'touringh7',
-    'royalcomfort',
-    'royalmile',
-    'royaleco',
-    'transerenuseco'
-  ];
-  if (rubrosExactos.includes(normal)) return true;
+  const exactos = ['touringh7', 'royalcomfort', 'royalmile', 'royaleco', 'transerenuseco'];
+  if (exactos.includes(normal)) return true;
   return normal.startsWith('royal') || normal.startsWith('trans');
 }
 
@@ -106,11 +152,14 @@ function renderTable(data) {
   data.forEach(item => {
     const tr = document.createElement('tr');
 
+    // Mostrar/copiar SIEMPRE el primer código
+    const codigoDisplay = primaryCode(item.codigo);
+
     const buttonHTML = `
       <button 
         class="copy-btn" 
-        title="Copiar código: ${item.codigo || ''}" 
-        data-codigo="${item.codigo || ''}"
+        title="Copiar código: ${codigoDisplay}" 
+        data-codigo="${codigoDisplay}"
         style="background:none;border:none;cursor:pointer;padding:0;">
         <img width="18px" src="./media/content-copy.svg" alt="Copiar">
       </button>
@@ -156,7 +205,7 @@ function aplicarFiltros() {
   if (valor) {
     datos = datos.filter(
       item =>
-        (item.codigo && item.codigo.toLowerCase().includes(valor)) ||
+        (item.codigo && String(item.codigo).toLowerCase().includes(valor)) ||
         (item.descripcion && item.descripcion.toLowerCase().includes(valor))
     );
   }
@@ -182,18 +231,19 @@ async function cargarDatos(stock) {
     const dataStock = await respStock.json();
     const dataPrices = await respPrices.json();
 
-    // Mapa de precios: almacenar TODAS las variantes de cada código de price
+    // Mapa de precios: guardar TODAS las variantes para cada código de price
     const priceMap = new Map();
     (Array.isArray(dataPrices) ? dataPrices : []).forEach(p => {
       const precio = p?.precio ?? null;
-      codeKeys(p?.codigo).forEach(k => {
+      // indexar por variantes del código de la tabla de precios
+      codeKeysOne(p?.codigo).forEach(k => {
         if (!priceMap.has(k)) priceMap.set(k, precio);
       });
     });
 
-    // Merge: para cada item de stock, buscar precio por variantes del código
+    // Merge: para cada item de stock, probar candidatos en orden (F42, luego F68, etc.)
     allData = (Array.isArray(dataStock) ? dataStock : []).map(item => {
-      const keys = codeKeys(item?.codigo);
+      const keys = codeKeys(item?.codigo); // ordenadas por prioridad
       let precio = null;
       for (const k of keys) {
         if (priceMap.has(k)) {
